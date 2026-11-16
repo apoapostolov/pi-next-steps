@@ -19,8 +19,8 @@ A Pi port of the Hermes **Next Steps** plugin, adapted for the Pi coding agent's
 ## Install
 
 ```bash
-pi install /absolute/path/to/pi-next-steps
-# or, once published:
+pi install npm:pi-next-steps
+# or from git:
 pi install git:github.com/apoapostolov/pi-next-steps
 ```
 
