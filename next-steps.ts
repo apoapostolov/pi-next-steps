@@ -249,7 +249,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 			return `${n}. ${tags ? tags + " " : ""}${o}`;
 		});
 		const input = await ctx.ui.input(
-			"Next steps (comma-separated indices, or single number)",
+			"Next steps: type indices (e.g. 1,3) then Enter",
 			labels.join("  |  "),
 		);
 		if (!input) {
