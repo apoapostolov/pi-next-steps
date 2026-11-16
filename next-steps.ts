@@ -70,7 +70,6 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 
 	pi.on("turn_end", async () => {
 		if (state && state.options.length > 0) {
-			replyCounter++;
 			// age existing queue
 			for (const q of queue) q.age++;
 			queue.unshift({ options: state.options, rec: state.rec, risky: state.risky, subtitles: state.subtitles, age: 0 });
