@@ -10,6 +10,7 @@
  *   steerOnClick (bool, default false), accentRecommended (bool, default true).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -206,14 +207,79 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 				const n = i + 1;
 				const tags = [
 					settings.accentRecommended && recSet.has(String(n)) ? "★" : "",
-					settings.markRisky && riskySet.has(String(n)) ? "⚠" : "",
+					settings.markRisky && riskySet.has(String(n)) ? "▲" : "",
 				].filter(Boolean).join(" ");
 				const sub = state!.subtitles[i] ? `  — ${state!.subtitles[i]}` : "";
 				return `${n}. ${tags ? tags + " " : ""}${o}${sub}`;
 			});
-			ctx.ui.notify(`Next steps registered. Run /ns to pick.`, "info");
+			// Render an interactive choice right away instead of forcing /ns.
+			const choiceLabels = state.options.map((o, i) => {
+				const n = i + 1;
+				const recTag = settings.accentRecommended && recSet.has(String(n)) ? " ★ RECOMMENDED" : "";
+				const riskyTag = settings.markRisky && riskySet.has(String(n)) ? " ▲ RISKY" : "";
+				const sub = state!.subtitles[i] ? `  — ${state!.subtitles[i]}` : "";
+				return `${o}${sub}${recTag}${riskyTag}`;
+			});
+			try {
+				const selected = new Set<number>();
+				const result = await ctx.ui.custom<number[] | null>((tui, theme, _kb, done) => {
+					let cursor = 0;
+					const component = {
+						focused: true,
+						render(_width: number): string[] {
+							const lines: string[] = [];
+							lines.push(theme.fg("accent", "Next steps (space toggle, enter confirm):"));
+							for (let i = 0; i < choiceLabels.length; i++) {
+								const check = selected.has(i) ? "[x]" : "[ ]";
+								const prefix = i === cursor ? theme.fg("accent", "> ") : "  ";
+								lines.push(`${prefix}${check} ${choiceLabels[i]}`);
+							}
+							lines.push(theme.fg("dim", "space toggle · ↑↓ move · enter/tab confirm · esc cancel"));
+							return lines;
+						},
+						invalidate() {},
+						handleInput(data: string) {
+							if (matchesKey(data, "up") || matchesKey(data, "k")) {
+								cursor = (cursor - 1 + choiceLabels.length) % choiceLabels.length;
+								tui.requestRender();
+							} else if (matchesKey(data, "down") || matchesKey(data, "j")) {
+								cursor = (cursor + 1) % choiceLabels.length;
+								tui.requestRender();
+							} else if (matchesKey(data, "space")) {
+								if (selected.has(cursor)) selected.delete(cursor);
+								else selected.add(cursor);
+								tui.requestRender();
+							} else if (matchesKey(data, "enter") || matchesKey(data, "tab")) {
+								done(Array.from(selected).sort((a, b) => a - b));
+							} else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+								done(null);
+							}
+						},
+					};
+					return component;
+				});
+				if (result && result.length > 0) {
+					const chosen = result.map((n) => state!.options[n]);
+					const message = chosen.length === 1 ? chosen[0] : chosen.map((c) => `- ${c}`).join("\n");
+					if (ctx.isIdle()) {
+						pi.sendUserMessage(message);
+					} else if (settings.steerOnClick) {
+						pi.sendUserMessage(message, { deliverAs: "steer" });
+					} else {
+						pi.sendUserMessage(message, { deliverAs: "followUp" });
+					}
+					if (queue.length > 0) queue.shift();
+					ctx.ui.notify(`Sent ${chosen.length} step(s)`, "info");
+				} else if (result !== null) {
+					// empty selection (enter with nothing toggled) — send nothing
+					ctx.ui.notify("No selection", "info");
+				}
+			} catch {
+				// Non-interactive mode or UI unavailable; fall back to /ns.
+			}
+			ctx.ui.notify(`Next steps registered.`, "info");
 			return {
-				content: [{ type: "text", text: `Registered ${opts.length} next steps:\n${lines.join("\n")}\nUse /ns to pick and send.` }],
+				content: [{ type: "text", text: `Registered ${opts.length} next steps:\n${lines.join("\n")}` }],
 			};
 		},
 	});
@@ -244,7 +310,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 			const n = i + 1;
 			const tags = [
 				settings.accentRecommended && recSet.has(String(n)) ? "★" : "",
-				settings.markRisky && riskySet.has(String(n)) ? "⚠" : "",
+				settings.markRisky && riskySet.has(String(n)) ? "▲" : "",
 			].filter(Boolean).join(" ");
 			return `${n}. ${tags ? tags + " " : ""}${o}`;
 		});

@@ -1,6 +1,6 @@
 {
   "name": "pi-next-steps",
-  "version": "1.1.1",
+  "version": "1.1.5",
   "description": "Next Steps extension for the Pi coding agent",
   "type": "module",
   "main": "next-steps.ts",
