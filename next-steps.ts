@@ -69,7 +69,6 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 			let rec = (args.rec as string) ?? "";
 			let risky = (args.risky as string) ?? "";
 			// Auto-classify recommended/risky via the session model when not provided.
-			let classifyError = "";
 			if (!rec && !risky && ctx?.model) {
 				try {
 					const model = ctx.model;
@@ -89,24 +88,24 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 						let msg: any = null;
 						for await (const ev of stream) {
 							if (ev.type === "done") msg = ev.message;
-							if (ev.type === "error") { classifyError = `stream-error=${ev.error?.errorMessage ?? ev.reason}`; }
 						}
 						if (!msg) msg = await stream.result();
 						const text = Array.isArray(msg?.content)
 							? msg.content.map((c: any) => c?.text ?? "").join("")
 							: String(msg?.content ?? "");
-						// success: clear the debug error
-						if (rec || risky) classifyError = "";
 						const m = text.match(/\{[\s\S]*\}/);
 						if (m) {
-							classifyError = `parsed=${m[0].slice(0, 120)}`;
-							const j = JSON.parse(m[0]);
-							if (Array.isArray(j.rec)) rec = j.rec.join(",");
-							if (Array.isArray(j.risky)) risky = j.risky.join(",");
+							try {
+								const j = JSON.parse(m[0]);
+								if (Array.isArray(j.rec)) rec = j.rec.join(",");
+								if (Array.isArray(j.risky)) risky = j.risky.join(",");
+							} catch {
+								// ignore parse errors
+							}
 						}
 					}
-				} catch (e: any) {
-					classifyError = e?.message ?? String(e);
+				} catch {
+					// classification is best-effort
 				}
 			}
 			state = {
@@ -127,11 +126,9 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 				const sub = state!.subtitles[i] ? `  — ${state!.subtitles[i]}` : "";
 				return `${n}. ${tags ? tags + " " : ""}${o}${sub}`;
 			});
-			const debug = ` [model=${ctx?.model?.id ?? "none"}, rec=${rec || "-"}, risky=${risky || "-"}${classifyError ? ", err=" + classifyError : ""}]`;
-
-			ctx.ui.notify(`Next steps registered (rec=${rec || "-"}, risky=${risky || "-"})${debug}. Run /ns to pick.`, "info");
+			ctx.ui.notify(`Next steps registered (rec=${rec || "-"}, risky=${risky || "-"}). Run /ns to pick.`, "info");
 			return {
-				content: [{ type: "text", text: `Registered ${opts.length} next steps:\n${lines.join("\n")}\nUse /ns to pick and send.${debug}` }],
+				content: [{ type: "text", text: `Registered ${opts.length} next steps:\n${lines.join("\n")}\nUse /ns to pick and send.` }],
 			};
 		},
 	});
