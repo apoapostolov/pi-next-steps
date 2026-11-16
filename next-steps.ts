@@ -51,7 +51,7 @@ function loadSettings(): Settings {
 
 export default function (pi: ExtensionAPI) {
 	const settings = loadSettings();
-	let state: NextStepsState | null = null;
+	let states: NextStepsState[] = [];
 	// carry-forward queue: array of { options, rec, risky, subtitles, age }
 	const queue: { options: string[]; rec: string; risky: string; subtitles: string[]; age: number }[] = [];
 
@@ -97,30 +97,33 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 
 	pi.on("turn_end", async (event: any) => {
 		// prose-offer rewrite
-		if (settings.rewriteProseOffers && !state) {
+		if (settings.rewriteProseOffers && states.length === 0) {
 			try {
 				const msgs = event?.messages ?? [];
 				const lastAssistant = [...msgs].reverse().find((m: any) => m?.role === "assistant");
-				const text = typeof lastAssistant?.content === "string"
-					? lastAssistant.content
-					: Array.isArray(lastAssistant?.content)
-						? lastAssistant.content.map((c: any) => c?.text ?? "").join("")
-						: "";
+				let text = "";
+				if (typeof lastAssistant?.content === "string") {
+					text = lastAssistant.content;
+				} else if (Array.isArray(lastAssistant?.content)) {
+					text = lastAssistant.content.map((c: any) => c?.text ?? "").join("");
+				}
 				const opts = planOffer(text);
 				if (opts && opts.length >= 2) {
-					state = { options: opts, multi: true, rec: "", risky: "", subtitles: [], alternates: "" };
+					states.push({ options: opts, multi: true, rec: "", risky: "", subtitles: [], alternates: "" });
 				}
 			} catch {
 				// ignore
 			}
 		}
-		if (state && state.options.length > 0) {
+		if (states.length > 0) {
 			// age existing queue
 			for (const q of queue) q.age++;
-			queue.unshift({ options: state.options, rec: state.rec, risky: state.risky, subtitles: state.subtitles, age: 0 });
-			if (queue.length > 30) queue.pop();
-			// clear state after carrying
-			if (!settings.carryForward) state = null;
+			for (const st of states) {
+				queue.unshift({ options: st.options, rec: st.rec, risky: st.risky, subtitles: st.subtitles, age: 0 });
+				if (queue.length > 30) queue.pop();
+			}
+			// clear states after carrying
+			if (!settings.carryForward) states = [];
 		}
 	});
 
@@ -192,7 +195,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 				}
 			}
 			const alternates = (args.alternates as string) ?? "";
-			state = {
+			const newState: NextStepsState = {
 				options: opts,
 				multi: args.multi !== false,
 				rec,
@@ -200,24 +203,26 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 				subtitles: (args.subtitles as string[]) ?? [],
 				alternates,
 			};
+			states.push(newState);
 			if (args.carry === true) settings.carryForward = true;
-			const recSet = new Set((state.rec || "").split(",").map((s) => s.trim()));
-			const riskySet = new Set((state.risky || "").split(",").map((s) => s.trim()));
-			const lines = state.options.map((o, i) => {
+			const recSet = new Set((states[0].rec || "").split(",").map((s) => s.trim()));
+			const riskySet = new Set((states[0].risky || "").split(",").map((s) => s.trim()));
+			const lines = newState.options.map((o, i) => {
 				const n = i + 1;
 				const tags = [
 					settings.accentRecommended && recSet.has(String(n)) ? "★" : "",
 					settings.markRisky && riskySet.has(String(n)) ? "▲" : "",
 				].filter(Boolean).join(" ");
-				const sub = state!.subtitles[i] ? `  — ${state!.subtitles[i]}` : "";
-				return `${n}. ${tags ? tags + " " : ""}${o}${sub}`;
+				const sub = newState.subtitles[i] ? `  — ${newState.subtitles[i]}` : "";
+				const tagPrefix = tags ? `${tags} ` : "";
+				return `${n}. ${tagPrefix}${o}${sub}`;
 			});
 			// Render an interactive choice right away instead of forcing /ns.
-			const choiceLabels = state.options.map((o, i) => {
+			const choiceLabels = newState.options.map((o, i) => {
 				const n = i + 1;
 				const recTag = settings.accentRecommended && recSet.has(String(n)) ? " ★ RECOMMENDED" : "";
 				const riskyTag = settings.markRisky && riskySet.has(String(n)) ? " ▲ RISKY" : "";
-				const sub = state!.subtitles[i] ? `  — ${state!.subtitles[i]}` : "";
+				const sub = newState.subtitles[i] ? `  — ${newState.subtitles[i]}` : "";
 				return `${o}${sub}${recTag}${riskyTag}`;
 			});
 			try {
@@ -259,7 +264,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 					return component;
 				});
 				if (result && result.length > 0) {
-					const chosen = result.map((n) => state!.options[n]);
+					const chosen = result.map((n) => newState.options[n]);
 					const message = chosen.length === 1 ? chosen[0] : chosen.map((c) => `- ${c}`).join("\n");
 					if (ctx.isIdle()) {
 						pi.sendUserMessage(message);
@@ -285,23 +290,23 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 	});
 
 	async function pickAndSend(ctx: any) {
-		if (!state || state.options.length === 0) {
+		if (states.length === 0 || states[0].options.length === 0) {
 			// try carry-forward queue
 			if (queue.length > 0) {
 				const q = queue[0];
-				state = { options: q.options, multi: true, rec: q.rec, risky: q.risky, subtitles: q.subtitles, alternates: "" };
+				states = [{ options: q.options, multi: true, rec: q.rec, risky: q.risky, subtitles: q.subtitles, alternates: "" }];
 			} else {
 				ctx.ui.notify("No next steps registered. Ask the agent to call next_steps.", "warning");
 				return;
 			}
 		}
-		const opts = state.options;
-		const recSet = new Set((state.rec || "").split(",").map((s) => s.trim()));
-		const riskySet = new Set((state.risky || "").split(",").map((s) => s.trim()));
+		const opts = states[0].options;
+		const recSet = new Set((states[0].rec || "").split(",").map((s) => s.trim()));
+		const riskySet = new Set((states[0].risky || "").split(",").map((s) => s.trim()));
 		// parse alternate groups
 		const altGroups: number[][] = [];
-		if (state.alternates) {
-			for (const g of state.alternates.split("|")) {
+		if (states[0].alternates) {
+			for (const g of states[0].alternates.split("|")) {
 				const members = g.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n >= 1 && n <= opts.length);
 				if (members.length >= 2) altGroups.push(members);
 			}
@@ -312,7 +317,8 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 				settings.accentRecommended && recSet.has(String(n)) ? "★" : "",
 				settings.markRisky && riskySet.has(String(n)) ? "▲" : "",
 			].filter(Boolean).join(" ");
-			return `${n}. ${tags ? tags + " " : ""}${o}`;
+			const tagPrefix2 = tags ? `${tags} ` : "";
+			return `${n}. ${tagPrefix2}${o}`;
 		});
 		const input = await ctx.ui.input(
 			"Next steps: type indices (e.g. 1,3) then Enter",
