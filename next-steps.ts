@@ -27,12 +27,13 @@ interface Settings {
 	carryForward: boolean;
 	steerOnClick: boolean;
 	accentRecommended: boolean;
+	rewriteProseOffers: boolean;
 }
 
 const SETTINGS_PATH = join(process.env.HOME || process.env.USERPROFILE || ".", ".pi", "agent", "next-steps.json");
 
 function loadSettings(): Settings {
-	const defaults: Settings = { markRisky: false, carryForward: false, steerOnClick: false, accentRecommended: true };
+	const defaults: Settings = { markRisky: false, carryForward: false, steerOnClick: false, accentRecommended: true, rewriteProseOffers: false };
 	try {
 		if (existsSync(SETTINGS_PATH)) {
 			const raw = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
@@ -68,7 +69,50 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 		return { systemPrompt: sp };
 	});
 
-	pi.on("turn_end", async () => {
+	// Prose-offer parser: detect a trailing offer in the last assistant message.
+	function planOffer(text: string): string[] | null {
+		if (!text || !text.trim()) return null;
+		const TRIGGER = /(?:want me to|should i|shall i|do you want|pick one|choose one)\b/i;
+		const blocks = text.split("\n\n");
+		let last = -1;
+		for (let i = blocks.length - 1; i >= 0; i--) {
+			if (blocks[i].trim()) { last = i; break; }
+		}
+		if (last < 0) return null;
+		const lastBlock = blocks[last].trim();
+		if (!TRIGGER.test(lastBlock)) return null;
+		// extract bullets
+		const bullets: string[] = [];
+		for (const line of lastBlock.split("\n")) {
+			const m = line.match(/^[-*•]\s+(.+)$/);
+			if (m) bullets.push(m[1].trim());
+		}
+		if (bullets.length >= 2) return bullets.slice(0, 6);
+		// single sentence option
+		const sentence = lastBlock.replace(TRIGGER, "").trim();
+		if (sentence.length > 0 && sentence.length < 120) return [sentence];
+		return null;
+	}
+
+	pi.on("turn_end", async (event: any) => {
+		// prose-offer rewrite
+		if (settings.rewriteProseOffers && !state) {
+			try {
+				const msgs = event?.messages ?? [];
+				const lastAssistant = [...msgs].reverse().find((m: any) => m?.role === "assistant");
+				const text = typeof lastAssistant?.content === "string"
+					? lastAssistant.content
+					: Array.isArray(lastAssistant?.content)
+						? lastAssistant.content.map((c: any) => c?.text ?? "").join("")
+						: "";
+				const opts = planOffer(text);
+				if (opts && opts.length >= 2) {
+					state = { options: opts, multi: true, rec: "", risky: "", subtitles: [], alternates: "" };
+				}
+			} catch {
+				// ignore
+			}
+		}
 		if (state && state.options.length > 0) {
 			// age existing queue
 			for (const q of queue) q.age++;
