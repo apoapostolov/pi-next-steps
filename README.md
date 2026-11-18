@@ -34,7 +34,14 @@ The agent calls `next_steps` automatically when a reply ends with a choice. You 
 /ns
 ```
 
-Type comma-separated indices (e.g. `1,3`) or a single number, then press Enter. The chosen step(s) are sent as the next user turn (queued if the agent is busy).
+A tabbed picker opens with one tab per collected reply, newest first. Space toggles a label, arrows move and switch tab, Enter sends. Every chosen step travels as one user message, so a pick that spans several tabs still costs one turn. Carried labels show how many offering replies back they came from.
+
+Clear what you no longer want:
+
+```
+/ns clear     # drop stale steps from older replies, keep the last prompt's
+/ns clear 2   # drop the steps collected in the last 2 posts
+```
 
 Alias: `/nextsteps`.
 

@@ -52,11 +52,35 @@ function loadSettings(): Settings {
 export default function (pi: ExtensionAPI) {
 	const settings = loadSettings();
 	let states: NextStepsState[] = [];
-	// carry-forward queue: array of { options, rec, risky, subtitles, age }, newest first
-	const queue: { options: string[]; rec: string; risky: string; subtitles: string[]; age: number }[] = [];
+	// carry-forward queue: array of { options, rec, risky, subtitles, age, reply }, newest first
+	const queue: { options: string[]; rec: string; risky: string; subtitles: string[]; age: number; reply: number }[] = [];
+	// Counts replies that offered steps, so `/ns clear X` can target the last X posts.
+	let replyCounter = 0;
 	const keyOf = (options: string[]) => options.join("\u0000");
-	// Blocks answered during their own turn, so turn_end does not queue them again.
-	const answeredKeys = new Set<string>();
+	// Labels answered during their own turn; only what is left gets carried.
+	const pickedThisTurn = new Set<string>();
+
+	// Drop answered labels from a block and remap its tags so the indexes still line up.
+	function withoutPicked(st: NextStepsState) {
+		const keep: number[] = [];
+		st.options.forEach((o, i) => {
+			if (!pickedThisTurn.has(o)) keep.push(i);
+		});
+		const remap = (list: string) =>
+			list
+				.split(",")
+				.map((s) => parseInt(s.trim(), 10))
+				.filter((n) => !isNaN(n))
+				.map((n) => keep.indexOf(n - 1) + 1)
+				.filter((n) => n > 0)
+				.join(",");
+		return {
+			options: keep.map((i) => st.options[i]),
+			rec: remap(st.rec),
+			risky: remap(st.risky),
+			subtitles: keep.map((i) => st.subtitles[i] ?? ""),
+		};
+	}
 
 	// Remove picked labels from every carried block; a block with nothing left is dropped.
 	function retirePicked(picked: string[]) {
@@ -129,16 +153,18 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 		if (states.length > 0) {
 			// age existing queue
 			for (const q of queue) q.age++;
+			replyCounter++;
 			for (const st of states) {
-				const key = keyOf(st.options);
-				if (answeredKeys.has(key)) continue;
+				const rest = withoutPicked(st);
+				if (rest.options.length === 0) continue;
+				const key = keyOf(rest.options);
 				if (queue.some((q) => q.age === 0 && keyOf(q.options) === key)) continue;
-				queue.unshift({ options: st.options, rec: st.rec, risky: st.risky, subtitles: st.subtitles, age: 0 });
+				queue.unshift({ ...rest, age: 0, reply: replyCounter });
 			}
 			while (queue.length > 30) queue.pop();
 			// States are per reply; the queue is the only place a block survives.
 			states = [];
-			answeredKeys.clear();
+			pickedThisTurn.clear();
 		}
 	});
 
@@ -288,7 +314,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 					} else {
 						pi.sendUserMessage(message, { deliverAs: "followUp" });
 					}
-					answeredKeys.add(keyOf(newState.options));
+					for (const c of chosen) pickedThisTurn.add(c);
 					retirePicked(chosen);
 					ctx.ui.notify(`Sent ${chosen.length} step(s)`, "info");
 				} else if (result !== null) {
@@ -406,13 +432,66 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 		ctx.ui.notify(`Sent ${chosen.length} step(s)`, "info");
 	}
 
+	// `/ns clear` drops everything older than the newest reply; `/ns clear X` drops the last X posts.
+	async function clearSteps(arg: string, ctx: any) {
+		const trimmed = arg.trim();
+		if (queue.length === 0) {
+			ctx.ui.notify("No collected next steps to clear.", "info");
+			return;
+		}
+		if (/^clear$/i.test(trimmed)) {
+			const before = queue.length;
+			const newest = queue[0].reply;
+			for (let i = queue.length - 1; i >= 0; i--) {
+				if (queue[i].reply < newest) queue.splice(i, 1);
+			}
+			const dropped = before - queue.length;
+			ctx.ui.notify(
+				dropped > 0
+					? `Cleared ${dropped} stale step(s). Kept the newest reply.`
+					: "Nothing stale to clear. Use /ns clear X for the last X posts.",
+				"info",
+			);
+			return;
+		}
+		const m = trimmed.match(/^clear\s+(\d+)$/i);
+		if (m) {
+			const n = parseInt(m[1], 10);
+			if (n < 1) {
+				ctx.ui.notify("Usage: /ns clear [X]", "warning");
+				return;
+			}
+			const cutoff = replyCounter - n + 1;
+			const before = queue.length;
+			for (let i = queue.length - 1; i >= 0; i--) {
+				if (queue[i].reply >= cutoff) queue.splice(i, 1);
+			}
+			const dropped = before - queue.length;
+			ctx.ui.notify(
+				dropped > 0
+					? `Cleared ${dropped} step(s) from the last ${n} post(s).`
+					: `No collected steps in the last ${n} post(s).`,
+				"info",
+			);
+			return;
+		}
+		ctx.ui.notify("Usage: /ns clear (stale) or /ns clear X (last X posts)", "warning");
+	}
+
+	const runOrClear = async (args: string, ctx: any) => {
+		const a = (args ?? "").trim();
+		if (!a) return pickAndSend(ctx);
+		if (/^clear\b/i.test(a) || /^clear$/i.test(a)) return clearSteps(a, ctx);
+		ctx.ui.notify("Usage: /ns or /ns clear [X]", "warning");
+	};
+
 	pi.registerCommand("ns", {
-		description: "Pick and send a registered next step (/ns).",
-		handler: async (_args, ctx) => pickAndSend(ctx),
+		description: "Pick and send a registered next step, or /ns clear [X] to drop collected steps.",
+		handler: async (args, ctx) => runOrClear(args, ctx),
 	});
 	pi.registerCommand("nextsteps", {
-		description: "Pick and send a registered next step (/nextsteps).",
-		handler: async (_args, ctx) => pickAndSend(ctx),
+		description: "Pick and send a registered next step, or /nextsteps clear [X] to drop collected steps.",
+		handler: async (args, ctx) => runOrClear(args, ctx),
 	});
 	pi.registerCommand("nextsteps-settings", {
 		description: "Show next-steps settings path.",

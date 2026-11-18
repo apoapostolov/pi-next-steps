@@ -12,6 +12,8 @@ block, enter sends.
 - Picked steps are retired from the queue, and a block answered in its own
 reply is never queued afterwards.
 - Every selection still travels as one user message.
+- `/ns clear` drops stale steps from older replies and keeps the last prompt's,
+- `/ns clear X` drops the steps collected in the last X posts.
 
 ## 1.1.5 — 2026-11-16
 
