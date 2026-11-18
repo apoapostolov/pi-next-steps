@@ -36,6 +36,8 @@ The agent calls `next_steps` automatically when a reply ends with a choice. You 
 
 A tabbed picker opens with one tab per collected reply, newest first. Space toggles a label, arrows move and switch tab, Enter sends. Every chosen step travels as one user message, so a pick that spans several tabs still costs one turn. Carried labels show how many offering replies back they came from.
 
+Stale carried steps can be pruned from the picker. On an older tab, Ctrl+D turns the focused row red, then Ctrl+D again deletes it. Shift+Ctrl+D turns every stale row red, and a second Shift+Ctrl+D deletes all of them. The current reply's rows cannot be deleted this way. `/ns clear` remains the coarse option when you want whole older replies gone at once.
+
 Clear what you no longer want:
 
 ```

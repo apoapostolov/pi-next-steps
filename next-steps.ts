@@ -23,6 +23,15 @@ interface NextStepsState {
 	alternates: string;
 }
 
+interface QueueEntry {
+	options: string[];
+	rec: string;
+	risky: string;
+	subtitles: string[];
+	age: number;
+	reply: number;
+}
+
 interface Settings {
 	markRisky: boolean;
 	carryForward: boolean;
@@ -52,8 +61,8 @@ function loadSettings(): Settings {
 export default function (pi: ExtensionAPI) {
 	const settings = loadSettings();
 	let states: NextStepsState[] = [];
-	// carry-forward queue: array of { options, rec, risky, subtitles, age, reply }, newest first
-	const queue: { options: string[]; rec: string; risky: string; subtitles: string[]; age: number; reply: number }[] = [];
+	// carry-forward queue, newest first
+	const queue: QueueEntry[] = [];
 	// Counts replies that offered steps, so `/ns clear X` can target the last X posts.
 	let replyCounter = 0;
 	const keyOf = (options: string[]) => options.join("\u0000");
@@ -80,6 +89,21 @@ export default function (pi: ExtensionAPI) {
 			risky: remap(st.risky),
 			subtitles: keep.map((i) => st.subtitles[i] ?? ""),
 		};
+	}
+
+	// Remove one carried option and keep its recommendation, risk and subtitle indexes aligned.
+	function dropOption(q: QueueEntry, index: number) {
+		q.options.splice(index, 1);
+		q.subtitles.splice(index, 1);
+		const remap = (list: string) =>
+			list
+				.split(",")
+				.map((s) => parseInt(s.trim(), 10))
+				.filter((n) => !isNaN(n) && n !== index + 1)
+				.map((n) => (n > index + 1 ? n - 1 : n))
+				.join(",");
+		q.rec = remap(q.rec);
+		q.risky = remap(q.risky);
 	}
 
 	// Remove picked labels from every carried block; a block with nothing left is dropped.
@@ -358,7 +382,50 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 			chosen = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
 				let tab = 0;
 				let cursor = 0;
-				const picked = new Set<string>();
+				let picked = new Set<string>();
+				let armed = new Set<string>();
+				const staleKeys = () => {
+					const keys: string[] = [];
+					blocks.forEach((block, b) => {
+						if (b > 0) block.items.forEach((_, i) => keys.push(`${b}:${i}`));
+					});
+					return keys;
+				};
+				const reindex = (set: Set<string>, block: number, item?: number) => {
+					const out = new Set<string>();
+					for (const key of set) {
+						const [b, i] = key.split(":").map(Number);
+						if (b === block && (item === undefined || i === item)) continue;
+						out.add(`${b > block ? b - 1 : b}:${b === block && item !== undefined && i > item ? i - 1 : i}`);
+					}
+					return out;
+				};
+				const deleteArmed = (keys: string[]) => {
+					const byBlock = new Map<number, number[]>();
+					for (const key of keys) {
+						const [b, i] = key.split(":").map(Number);
+						byBlock.set(b, [...(byBlock.get(b) ?? []), i]);
+					}
+					for (const b of [...byBlock.keys()].sort((x, y) => y - x)) {
+						const items = byBlock.get(b);
+						if (!items) continue;
+						for (const i of items.sort((x, y) => y - x)) {
+							blocks[b].items.splice(i, 1);
+							dropOption(queue[b], i);
+							picked = reindex(picked, b, i);
+							armed = reindex(armed, b, i);
+						}
+						if (blocks[b].items.length === 0) {
+							blocks.splice(b, 1);
+							queue.splice(b, 1);
+							picked = reindex(picked, b);
+							armed = reindex(armed, b);
+						}
+					}
+					tab = Math.min(tab, blocks.length - 1);
+					cursor = Math.min(cursor, Math.max(0, blocks[tab].items.length - 1));
+					armed.clear();
+				};
 				const component = {
 					focused: true,
 					render(_width: number): string[] {
@@ -370,15 +437,29 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 							.join(" · ");
 						out.push(`${theme.fg("accent", "Next steps")}  ${head}`);
 						blocks[tab].items.forEach((item, i) => {
-							const mark = picked.has(`${tab}:${i}`) ? "[x]" : "[ ]";
+							const key = `${tab}:${i}`;
+							const mark = picked.has(key) ? "[x]" : "[ ]";
 							const prefix = i === cursor ? theme.fg("accent", "> ") : "  ";
-							out.push(`${prefix}${mark} ${item.text}`);
+							const text = armed.has(key) ? theme.fg("error", `[del] ${item.text}`) : item.text;
+							out.push(`${prefix}${mark} ${text}`);
 						});
-						out.push(theme.fg("dim", "space toggle · ↑↓ move · ←→ block · enter/tab confirm · esc cancel"));
+						out.push(theme.fg("dim", "space toggle · ↑↓ move · ←→ block · ctrl+d delete stale · shift+ctrl+d all stale · enter/tab confirm · esc cancel"));
 						return out;
 					},
 					invalidate() {},
 					handleInput(data: string) {
+						const all = matchesKey(data, "shift+ctrl+d");
+						if (all || matchesKey(data, "ctrl+d")) {
+							let targets: string[] = [];
+							if (all) targets = staleKeys();
+							else if (tab > 0) targets = [`${tab}:${cursor}`];
+							if (targets.length > 0) {
+								if (targets.every((key) => armed.has(key))) deleteArmed(targets);
+								else for (const key of targets) armed.add(key);
+								tui.requestRender();
+								return;
+							}
+						}
 						const n = blocks[tab].items.length;
 						if (matchesKey(data, "up") || matchesKey(data, "k")) {
 							cursor = (cursor - 1 + n) % n;
@@ -391,13 +472,13 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 							tab = (tab + 1) % blocks.length;
 							cursor = 0;
 						} else if (matchesKey(data, "space")) {
-							const k = `${tab}:${cursor}`;
-							if (picked.has(k)) picked.delete(k);
-							else picked.add(k);
+							const key = `${tab}:${cursor}`;
+							if (picked.has(key)) picked.delete(key);
+							else picked.add(key);
 						} else if (matchesKey(data, "enter") || matchesKey(data, "tab")) {
 							done(
-								Array.from(picked).map((k) => {
-									const [b, i] = k.split(":").map(Number);
+								Array.from(picked).map((key) => {
+									const [b, i] = key.split(":").map(Number);
 									return blocks[b].items[i].option;
 								}),
 							);

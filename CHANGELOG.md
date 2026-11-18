@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0 - 2026-11-18
+
+- `/ns` can delete stale carried steps without leaving the picker. Ctrl+D on a stale row arms it in red, and a second Ctrl+D deletes it. Shift+Ctrl+D arms every stale row in red, and a second Shift+Ctrl+D deletes all of them. The current reply's rows stay untouched.
+
 ## 1.1.6 - 2026-11-18
 
 - Multiple blocks per reply: every `next_steps` call keeps its own options, so
