@@ -52,8 +52,21 @@ function loadSettings(): Settings {
 export default function (pi: ExtensionAPI) {
 	const settings = loadSettings();
 	let states: NextStepsState[] = [];
-	// carry-forward queue: array of { options, rec, risky, subtitles, age }
+	// carry-forward queue: array of { options, rec, risky, subtitles, age }, newest first
 	const queue: { options: string[]; rec: string; risky: string; subtitles: string[]; age: number }[] = [];
+	const keyOf = (options: string[]) => options.join("\u0000");
+	// Blocks answered during their own turn, so turn_end does not queue them again.
+	const answeredKeys = new Set<string>();
+
+	// Remove picked labels from every carried block; a block with nothing left is dropped.
+	function retirePicked(picked: string[]) {
+		const set = new Set(picked);
+		for (let i = queue.length - 1; i >= 0; i--) {
+			const rest = queue[i].options.filter((o) => !set.has(o));
+			if (rest.length === 0) queue.splice(i, 1);
+			else queue[i] = { ...queue[i], options: rest };
+		}
+	}
 
 	pi.on("before_agent_start", async (event) => {
 		const addition = `
@@ -61,9 +74,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 		let sp = (event.systemPrompt ?? "") + addition;
 		if (settings.carryForward && queue.length > 0) {
 			const carried = queue
-				.slice()
-				.reverse()
-				.map((q, i) => `[${i + 1} reply back] ${q.options.join(" | ")}`)
+				.map((q) => `[${q.age === 1 ? "1 reply" : `${q.age} replies`} back] ${q.options.join(" | ")}`)
 				.join("\n");
 			sp += `\n\nCarried unanswered options from earlier replies (youngest first):\n${carried}`;
 		}
@@ -119,11 +130,15 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 			// age existing queue
 			for (const q of queue) q.age++;
 			for (const st of states) {
+				const key = keyOf(st.options);
+				if (answeredKeys.has(key)) continue;
+				if (queue.some((q) => q.age === 0 && keyOf(q.options) === key)) continue;
 				queue.unshift({ options: st.options, rec: st.rec, risky: st.risky, subtitles: st.subtitles, age: 0 });
-				if (queue.length > 30) queue.pop();
 			}
-			// clear states after carrying
-			if (!settings.carryForward) states = [];
+			while (queue.length > 30) queue.pop();
+			// States are per reply; the queue is the only place a block survives.
+			states = [];
+			answeredKeys.clear();
 		}
 	});
 
@@ -273,7 +288,8 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 					} else {
 						pi.sendUserMessage(message, { deliverAs: "followUp" });
 					}
-					if (queue.length > 0) queue.shift();
+					answeredKeys.add(keyOf(newState.options));
+					retirePicked(chosen);
 					ctx.ui.notify(`Sent ${chosen.length} step(s)`, "info");
 				} else if (result !== null) {
 					// empty selection (enter with nothing toggled) — send nothing
@@ -290,62 +306,94 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 	});
 
 	async function pickAndSend(ctx: any) {
-		if (states.length === 0 || states[0].options.length === 0) {
-			// try carry-forward queue
-			if (queue.length > 0) {
-				const q = queue[0];
-				states = [{ options: q.options, multi: true, rec: q.rec, risky: q.risky, subtitles: q.subtitles, alternates: "" }];
-			} else {
-				ctx.ui.notify("No next steps registered. Ask the agent to call next_steps.", "warning");
-				return;
-			}
+		if (queue.length === 0) {
+			ctx.ui.notify("No next steps registered. Ask the agent to call next_steps.", "warning");
+			return;
 		}
-		const opts = states[0].options;
-		const recSet = new Set((states[0].rec || "").split(",").map((s) => s.trim()));
-		const riskySet = new Set((states[0].risky || "").split(",").map((s) => s.trim()));
-		// parse alternate groups
-		const altGroups: number[][] = [];
-		if (states[0].alternates) {
-			for (const g of states[0].alternates.split("|")) {
-				const members = g.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n >= 1 && n <= opts.length);
-				if (members.length >= 2) altGroups.push(members);
-			}
-		}
-		const labels = opts.map((o, i) => {
-			const n = i + 1;
-			const tags = [
-				settings.accentRecommended && recSet.has(String(n)) ? "★" : "",
-				settings.markRisky && riskySet.has(String(n)) ? "▲" : "",
-			].filter(Boolean).join(" ");
-			const tagPrefix2 = tags ? `${tags} ` : "";
-			return `${n}. ${tagPrefix2}${o}`;
+		// One tab per collected block, newest first. Carried blocks keep their real age.
+		const blocks = queue.map((q) => {
+			const recSet = new Set((q.rec || "").split(",").map((s) => s.trim()));
+			const riskySet = new Set((q.risky || "").split(",").map((s) => s.trim()));
+			return {
+				age: q.age,
+				items: q.options.map((o, i) => {
+					const tags = [
+						settings.accentRecommended && recSet.has(String(i + 1)) ? "★" : "",
+						settings.markRisky && riskySet.has(String(i + 1)) ? "▲" : "",
+					].filter(Boolean).join(" ");
+					return { option: o, text: `${tags ? tags + " " : ""}${o}` };
+				}),
+			};
 		});
-		const input = await ctx.ui.input(
-			"Next steps: type indices (e.g. 1,3) then Enter",
-			labels.join("  |  "),
-		);
-		if (!input) {
-			ctx.ui.notify("Cancelled", "info");
+		const tabLabel = (i: number) =>
+			i === 0 ? "this reply" : blocks[i].age === 1 ? "1 reply back" : `${blocks[i].age} replies back`;
+		let chosen: string[] | null = null;
+		try {
+			chosen = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+				let tab = 0;
+				let cursor = 0;
+				const picked = new Set<string>();
+				const component = {
+					focused: true,
+					render(_width: number): string[] {
+						const out: string[] = [];
+						const head = blocks
+							.map((_, i) =>
+								i === tab ? theme.fg("accent", `[${tabLabel(i)}]`) : theme.fg("dim", ` ${tabLabel(i)} `),
+							)
+							.join(" · ");
+						out.push(`${theme.fg("accent", "Next steps")}  ${head}`);
+						blocks[tab].items.forEach((item, i) => {
+							const mark = picked.has(`${tab}:${i}`) ? "[x]" : "[ ]";
+							const prefix = i === cursor ? theme.fg("accent", "> ") : "  ";
+							out.push(`${prefix}${mark} ${item.text}`);
+						});
+						out.push(theme.fg("dim", "space toggle · ↑↓ move · ←→ block · enter/tab confirm · esc cancel"));
+						return out;
+					},
+					invalidate() {},
+					handleInput(data: string) {
+						const n = blocks[tab].items.length;
+						if (matchesKey(data, "up") || matchesKey(data, "k")) {
+							cursor = (cursor - 1 + n) % n;
+						} else if (matchesKey(data, "down") || matchesKey(data, "j")) {
+							cursor = (cursor + 1) % n;
+						} else if (matchesKey(data, "left") || matchesKey(data, "h")) {
+							tab = (tab - 1 + blocks.length) % blocks.length;
+							cursor = 0;
+						} else if (matchesKey(data, "right") || matchesKey(data, "l")) {
+							tab = (tab + 1) % blocks.length;
+							cursor = 0;
+						} else if (matchesKey(data, "space")) {
+							const k = `${tab}:${cursor}`;
+							if (picked.has(k)) picked.delete(k);
+							else picked.add(k);
+						} else if (matchesKey(data, "enter") || matchesKey(data, "tab")) {
+							done(
+								Array.from(picked).map((k) => {
+									const [b, i] = k.split(":").map(Number);
+									return blocks[b].items[i].option;
+								}),
+							);
+							return;
+						} else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+							done(null);
+							return;
+						}
+						tui.requestRender();
+					},
+				};
+				return component;
+			});
+		} catch {
+			ctx.ui.notify("Selection UI unavailable in this session.", "warning");
 			return;
 		}
-		let indices = input
-			.split(",")
-			.map((s) => parseInt(s.trim(), 10))
-			.filter((n) => !isNaN(n) && n >= 1 && n <= opts.length);
-		// enforce alternate groups
-		for (const g of altGroups) {
-			const picked = indices.filter((n) => g.includes(n));
-			if (picked.length > 1) {
-				// keep the first
-				const first = picked[0];
-				indices = indices.filter((n) => !g.includes(n) || n === first);
-			}
-		}
-		if (indices.length === 0) {
-			ctx.ui.notify("No valid selection", "warning");
+		if (!chosen || chosen.length === 0) {
+			ctx.ui.notify("No selection", "info");
 			return;
 		}
-		const chosen = indices.map((n) => opts[n - 1]);
+		// Every picked step travels as one user message, never one message per step.
 		const message = chosen.length === 1 ? chosen[0] : chosen.map((c) => `- ${c}`).join("\n");
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(message);
@@ -354,8 +402,7 @@ When a reply naturally ends with a choice or "say the word and I'll...", call th
 		} else {
 			pi.sendUserMessage(message, { deliverAs: "followUp" });
 		}
-		// retire from carry queue
-		if (queue.length > 0) queue.shift();
+		retirePicked(chosen);
 		ctx.ui.notify(`Sent ${chosen.length} step(s)`, "info");
 	}
 
